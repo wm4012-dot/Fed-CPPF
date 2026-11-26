@@ -486,12 +486,12 @@ def calibrate_fusion_weight(
     elite_weight: float = 0.55,
     elite_tol: float = 0.005,
 ) -> tuple[float, dict]:
-    """Zero-leakage client-side dual-scale (macro top-25% + fine elite top-12) OOF calibration.
+    """Client-side dual-scale (macro top-25% + fine elite top-12) OOF calibration.
 
-    Directly measures whether the peer-only server potential improves BOTH macro-basin
-    identification AND fine-basin ranking among the client's top `elite_k` points.
-    Automatically reduces lambda toward 0 once local elite ranking outperforms the
-    biased peer consensus inside the client's refined basin.
+    Measures whether the peer-only server potential improves both macro-basin
+    identification and fine-basin ranking among the client's top `elite_k` points.
+    Reduces lambda toward 0 once local elite ranking outperforms the peer consensus
+    inside the client's refined basin.
     """
     loc = np.asarray(local_oof, dtype=float).reshape(-1)
     srv = np.asarray(server_scores, dtype=float).reshape(-1)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.spatial.distance import cdist
 
 from .framework import Client, ClientPackage
 from .model import (
@@ -65,6 +64,7 @@ class FedCPPFClient(Client):
         seed_max_local_rank: float = 0.35,
         seed_min_dist: float = 0.08,
         seed_min_adv: float = 0.25,
+        dual_arm_start: float = 0.45,
         ordinal_min_points: int = 50,
         n_probes: int = 100,
         lcb_kappa: float = 2.0,
@@ -103,6 +103,7 @@ class FedCPPFClient(Client):
         self.seed_max_local_rank = float(seed_max_local_rank)
         self.seed_min_dist = float(seed_min_dist)
         self.seed_min_adv = float(seed_min_adv)
+        self.dual_arm_start = float(np.clip(dual_arm_start, 0.0, 1.0))
         self.ordinal_min_points = int(ordinal_min_points)
         self.n_probes = int(n_probes)
         self.lcb_kappa = float(lcb_kappa)
@@ -133,6 +134,17 @@ class FedCPPFClient(Client):
         used = max(0, int(self.solutions.size) - int(self.fe_init))
         return float(np.clip(used / budget, 0.0, 1.0))
 
+    def _local_knn_rank_pct(
+        self, x_hist: np.ndarray, y_hist: np.ndarray, pt: np.ndarray
+    ) -> float:
+        """Inverse-distance KNN predicted rank percentile in [0, 1] (lower = better)."""
+        k = min(max(3, int(self.knn_k)), x_hist.shape[0])
+        dists = np.linalg.norm(x_hist - pt[None, :], axis=1)
+        idx = np.argpartition(dists, k - 1)[:k]
+        w = 1.0 / np.maximum(dists[idx], 1e-6)
+        r = rank01(y_hist)
+        return float(np.sum(w * r[idx]) / np.sum(w))
+
     def _gated_server_seeds(
         self,
         server_model: dict | None,
@@ -140,7 +152,6 @@ class FedCPPFClient(Client):
         progress: float,
         x_hist: np.ndarray,
         y_hist: np.ndarray,
-        local_scorer,
     ) -> np.ndarray | None:
         if (
             not self.seed_injection
@@ -152,34 +163,47 @@ class FedCPPFClient(Client):
         conf = float(server_model.get("peer_confidence", 0.0))
         if conf < self.seed_min_conf:
             return None
-        candidates = []
+        srv_arch = predict_server_model(server_model, x_hist)
+        if srv_arch is None:
+            return None
+        srv_sd = float(np.std(srv_arch))
+        if srv_sd <= 1e-12 or not np.all(np.isfinite(srv_arch)):
+            return None
+
+        best_idx = int(np.argmin(y_hist))
+        x_best = np.clip(x_hist[best_idx], 0.0, 1.0)
+        srv_best = float(srv_arch[best_idx])
+
+        raw_candidates: list[np.ndarray] = []
         for key in ("x_quad", "x_srv"):
             pt = server_model.get(key)
             if pt is None:
                 continue
-            arr = np.asarray(pt, dtype=float).reshape(1, -1)
-            if arr.shape[1] != self.dim or not np.all(np.isfinite(arr)):
+            arr = np.asarray(pt, dtype=float).reshape(-1)
+            if arr.shape[0] == self.dim and np.all(np.isfinite(arr)):
+                raw_candidates.append(np.clip(arr, 0.0, 1.0))
+        if not raw_candidates:
+            return None
+        # Midpoint bridge between current best x_best and primary server optimum
+        raw_candidates.append(np.clip(0.5 * x_best + 0.5 * raw_candidates[0], 0.0, 1.0))
+
+        accepted: list[np.ndarray] = []
+        for pt in raw_candidates:
+            if any(float(np.linalg.norm(pt - prev)) < 0.04 for prev in accepted):
                 continue
-            arr = np.clip(arr, 0.0, 1.0)
-            min_d = float(np.min(cdist(arr, x_hist))) / np.sqrt(float(self.dim))
-            if min_d < self.seed_min_dist:
+            d_min = float(np.min(np.linalg.norm(x_hist - pt[None, :], axis=1)))
+            if d_min < self.seed_min_dist:
                 continue
-            if local_scorer is not None:
-                all_s = np.asarray(local_scorer.score_points(x_hist), dtype=float).reshape(-1)
-                p_s = float(local_scorer.score_points(arr)[0])
-                local_rank = float(np.mean(all_s <= p_s))
-                if local_rank > self.seed_max_local_rank:
-                    continue
-            srv_hist = predict_server_model(server_model, x_hist)
-            srv_pt = predict_server_model(server_model, arr)
-            if srv_hist is not None and srv_pt is not None:
-                srv_sd = float(np.std(srv_hist))
-                if srv_sd > 1e-12:
-                    adv = (float(np.mean(srv_hist)) - float(srv_pt[0])) / srv_sd
-                    if adv < self.seed_min_adv:
-                        continue
-            candidates.append(arr[0])
-        return np.asarray(candidates, dtype=float) if candidates else None
+            if self._local_knn_rank_pct(x_hist, y_hist, pt) > self.seed_max_local_rank:
+                continue
+            sp = predict_server_model(server_model, pt[None, :])
+            if sp is None or not np.isfinite(sp[0]):
+                continue
+            adv = (srv_best - float(sp[0])) / srv_sd
+            if adv < self.seed_min_adv:
+                continue
+            accepted.append(pt)
+        return np.asarray(accepted, dtype=float) if accepted else None
 
     def _calibrate_lam(
         self,
@@ -192,7 +216,8 @@ class FedCPPFClient(Client):
         conf = float(server_model.get("peer_confidence", 0.0))
         eff_max = self.max_weight
         if self.late_taper:
-            taper = self.late_floor_ratio + (1.0 - self.late_floor_ratio) * ((1.0 - progress) ** 2)
+            t = float(np.clip(progress, 0.0, 1.0))
+            taper = 1.0 - (1.0 - self.late_floor_ratio) * (t * t)
             eff_max = eff_max * taper
         if not self.oof_calibration:
             return float(np.clip(min(self.fixed_weight, eff_max, conf), 0.0, 0.90))
@@ -239,6 +264,11 @@ class FedCPPFClient(Client):
             if loo_loc is not None and srv_arch is not None and srv_pool is not None:
                 lam = self._calibrate_lam(loo_loc, srv_arch, y_hist, server_model, progress)
                 if lam > 0.0:
+                    seeds = self._gated_server_seeds(server_model, lam, progress, x_hist, y_hist)
+                    if seeds is not None and seeds.size > 0:
+                        pool = np.vstack((pool, seeds))
+                        loc_pool = rank_knn_scores(pool, x_hist, y_hist, k=self.knn_k, kappa=self.knn_kappa)
+                        srv_pool = predict_server_model(server_model, pool)
                     loc_sd = max(float(np.std(loo_loc)), 1e-12)
                     srv_sd = max(float(np.std(srv_arch)), 1e-12)
                     loc_z = (loc_pool - float(np.mean(loo_loc))) / loc_sd
@@ -284,7 +314,7 @@ class FedCPPFClient(Client):
         use_ordinal = False
         full_ranker = None
         oof_scores = None
-        if x_hist.shape[0] >= self.ordinal_min_points:
+        if progress >= self.dual_arm_start and x_hist.shape[0] >= self.ordinal_min_points:
             full_ranker, oof_scores, _, accepted = fit_local_ranker_with_oof(
                 x_hist,
                 y_hist,
@@ -296,7 +326,7 @@ class FedCPPFClient(Client):
             )
             use_ordinal = bool(accepted and full_ranker is not None)
 
-        # Step 4: Thompson-sampling arm selection between Fused Ordinal CSO and Rank-KNN
+        # Step 4: Thompson-sampling arm selection once progress >= dual_arm_start (0.45)
         if use_ordinal:
             draw_knn = float(self._rng.beta(self._ts_alpha["knn"], self._ts_beta["knn"]))
             draw_ord = float(self._rng.beta(self._ts_alpha["ordinal"], self._ts_beta["ordinal"]))
@@ -324,9 +354,7 @@ class FedCPPFClient(Client):
                             srv_mu=float(np.mean(srv_arch)),
                             srv_sd=srv_sd,
                         )
-            seeds = self._gated_server_seeds(
-                server_model, lam, progress, x_hist, y_hist, full_ranker
-            )
+            seeds = self._gated_server_seeds(server_model, lam, progress, x_hist, y_hist)
             u_next = cso_scalar_search(
                 scorer,
                 self.dim,

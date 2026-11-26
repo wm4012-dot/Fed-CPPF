@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
 from .model import rank01
 
@@ -211,7 +211,7 @@ def build_gp_lcb_probes(
     try:
         kernel = (
             ConstantKernel(1.0, (1e-3, 1e3))
-            * Matern(length_scale=np.ones(dim) * 0.5, length_scale_bounds=(1e-2, 1e2), nu=2.5)
+            * RBF(length_scale=np.ones(dim) * 0.5, length_scale_bounds=(1e-2, 1e2))
             + WhiteKernel(noise_level=1e-4, noise_level_bounds=(1e-6, 1e-1))
         )
         gp = GaussianProcessRegressor(
