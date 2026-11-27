@@ -450,7 +450,7 @@ def pairwise_concordance(scores: np.ndarray, truth: np.ndarray) -> float:
         return 0.5
     ds = scores[idx_i[keep]] - scores[idx_j[keep]]
     dt = dt[keep]
-    good = (ds * dt > 0.0).astype(float) + 0.5 * (np.abs(ds) <= TOL).astype(float)
+    good = np.where(np.abs(ds) <= TOL, 0.5, (ds * dt > 0.0).astype(float))
     return float(np.mean(good))
 
 
@@ -631,8 +631,8 @@ class FusedPotentialRanker:
         arr = np.asarray(X, dtype=float)
         if arr.ndim != 2 or arr.shape[1] != 2 * self.input_dim:
             raise ValueError("invalid pair dimension")
-        return self.score_points(arr[:, : self.input_dim]) - self.score_points(
-            arr[:, self.input_dim :]
+        return self.score_points(arr[:, self.input_dim :]) - self.score_points(
+            arr[:, : self.input_dim]
         )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
