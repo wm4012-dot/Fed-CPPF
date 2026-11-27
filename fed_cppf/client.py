@@ -116,6 +116,7 @@ class FedCPPFClient(Client):
         self._rng = np.random.default_rng(int(seed) + 1009 * int(self.id))
 
         # Beta-Bernoulli Thompson sampling state for (Rank-KNN, Fused Ordinal CSO)
+        self._ts_prior = {"knn": (2.0, 1.0), "ordinal": (1.0, 1.0)}
         self._ts_alpha = {"knn": 2.0, "ordinal": 1.0}
         self._ts_beta = {"knn": 1.0, "ordinal": 1.0}
         self._round = 0
@@ -372,8 +373,11 @@ class FedCPPFClient(Client):
         x_eval = self._from_unit(u_next).reshape(1, -1)
         y_new = float(np.asarray(self.problem.evaluate(x_eval)).ravel()[0])
         improved = y_new < prev_best
-        self._ts_alpha[chosen_arm] = 0.98 * self._ts_alpha[chosen_arm] + (1.0 if improved else 0.0)
-        self._ts_beta[chosen_arm] = 0.98 * self._ts_beta[chosen_arm] + (0.0 if improved else 1.0)
+        for arm_k, (pa, pb) in self._ts_prior.items():
+            self._ts_alpha[arm_k] = pa + 0.98 * (self._ts_alpha[arm_k] - pa)
+            self._ts_beta[arm_k] = pb + 0.98 * (self._ts_beta[arm_k] - pb)
+        self._ts_alpha[chosen_arm] += 1.0 if improved else 0.0
+        self._ts_beta[chosen_arm] += 0.0 if improved else 1.0
         self.lambda_history.append(lam)
         self.arm_history.append(chosen_arm)
         self.record_round_info("arm", chosen_arm)
